@@ -9,106 +9,35 @@
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
+import re
+import math
+
 import certstream
 import tqdm
+import yaml
+import time
+import os
+from Levenshtein import distance
+from termcolor import colored, cprint
+from tld import get_tld
 
-import entropy
+from confusables import unconfuse
 
-log_suspicious = 'suspicious_domains.log'
+certstream_url = 'wss://certstream.calidog.io'
 
-suspicious_keywords = [
-    'login',
-    'log-in',
-    'account',
-    'verification',
-    'verify',
-    'support',
-    'activity',
-    'security',
-    'update',
-    'authentication',
-    'authenticate',
-    'wallet',
-    'alert',
-    'purchase',
-    'transaction',
-    'recover',
-    'live',
-    'office'
-    ]
+log_suspicious = os.path.dirname(os.path.realpath(__file__))+'/suspicious_domains_'+time.strftime("%Y-%m-%d")+'.log'
 
-highly_suspicious = [
-    'paypal',
-    'paypol',
-    'poypal',
-    'twitter',
-    'appleid',
-    'gmail',
-    'outlook',
-    'protonmail',
-    'amazon',
-    'facebook',
-    'microsoft',
-    'windows',
-    'cgi-bin',
-    'localbitcoin',
-    'icloud',
-    'iforgot',
-    'isupport',
-    'kraken',
-    'bitstamp',
-    'bittrex',
-    'blockchain',
-    '.com-',
-    '-com.',
-    '.net-',
-    '.org-',
-    '.gov-',
-    '.gouv-',
-    '-gouv-'
-    ]
+suspicious_yaml = os.path.dirname(os.path.realpath(__file__))+'/suspicious.yaml'
 
-suspicious_tld = [
-    '.ga',
-    '.gq',
-    '.ml',
-    '.cf',
-    '.tk',
-    '.xyz',
-    '.pw',
-    '.cc',
-    '.club',
-    '.work',
-    '.top',
-    '.support',
-    '.bank',
-    '.info',
-    '.study',
-    '.party',
-    '.click',
-    '.country',
-    '.stream',
-    '.gdn',
-    '.mom',
-    '.xin',
-    '.kim',
-    '.men',
-    '.loan',
-    '.download',
-    '.racing',
-    '.online',
-    '.ren',
-    '.gb',
-    '.win',
-    '.review',
-    '.vip',
-    '.party',
-    '.tech',
-    '.science'
-    ]
+external_yaml = os.path.dirname(os.path.realpath(__file__))+'/external.yaml'
 
 pbar = tqdm.tqdm(desc='certificate_update', unit='cert')
 
+def entropy(string):
+    """Calculates the Shannon entropy of a string"""
+    prob = [ float(string.count(c)) / len(string) for c in dict.fromkeys(list(string)) ]
+    entropy = - sum([ p * math.log(p) / math.log(2.0) for p in prob ])
+    return entropy
 
 def score_domain(domain):
     """Score `domain`.
@@ -122,20 +51,53 @@ def score_domain(domain):
         int: the score of `domain`.
     """
     score = 0
-    for tld in suspicious_tld:
-        if domain.endswith(tld):
+    for t in suspicious['tlds']:
+        if domain.endswith(t):
             score += 20
-    for keyword in suspicious_keywords:
-        if keyword in domain:
-            score += 25
-    for keyword in highly_suspicious:
-        if keyword in domain:
-            score += 60
-    score += int(round(entropy.shannon_entropy(domain)*50))
+
+    # Remove initial '*.' for wildcard certificates bug
+    if domain.startswith('*.'):
+        domain = domain[2:]
+
+    # Removing TLD to catch inner TLD in subdomain (ie. paypal.com.domain.com)
+    try:
+        res = get_tld(domain, as_object=True, fail_silently=True, fix_protocol=True)
+        domain = '.'.join([res.subdomain, res.domain])
+    except Exception:
+        pass
+
+    # Higer entropy is kind of suspicious
+    score += int(round(entropy(domain)*10))
+
+    # Remove lookalike characters using list from http://www.unicode.org/reports/tr39
+    domain = unconfuse(domain)
+
+    words_in_domain = re.split("\W+", domain)
+
+    # ie. detect fake .com (ie. *.com-account-management.info)
+    if words_in_domain[0] in ['com', 'net', 'org']:
+        score += 10
+
+    # Testing keywords
+    for word in suspicious['keywords']:
+        if word in domain:
+            score += suspicious['keywords'][word]
+
+    # Testing Levenshtein distance for strong keywords (>= 70 points) (ie. paypol)
+    for key in [k for (k,s) in suspicious['keywords'].items() if s >= 70]:
+        # Removing too generic keywords (ie. mail.domain.com)
+        for word in [w for w in words_in_domain if w not in ['email', 'mail', 'cloud']]:
+            if distance(str(word), str(key)) == 1:
+                score += 70
 
     # Lots of '-' (ie. www.paypal-datacenter.com-acccount-alert.com)
     if 'xn--' not in domain and domain.count('-') >= 4:
-        score += 20
+        score += domain.count('-') * 3
+
+    # Deeply nested subdomains (ie. www.paypal.com.security.accountupdate.gq)
+    if domain.count('.') >= 3:
+        score += domain.count('.') * 3
+
     return score
 
 
@@ -149,18 +111,48 @@ def callback(message, context):
 
         for domain in all_domains:
             pbar.update(1)
-            score = score_domain(domain)
-            if score > 75:
+            score = score_domain(domain.lower())
+
+            # If issued from a free CA = more suspicious
+            if "Let's Encrypt" in message['data']['chain'][0]['subject']['aggregated']:
+                score += 10
+
+            if score >= 100:
                 tqdm.tqdm.write(
-                    "\033[91mSuspicious: "
-                    "\033[4m{}\033[0m\033[91m (score={})\033[0m".format(domain,
-                                                                        score))
+                    "[!] Suspicious: "
+                    "{} (score={})".format(colored(domain, 'red', attrs=['underline', 'bold']), score))
+            elif score >= 90:
+                tqdm.tqdm.write(
+                    "[!] Suspicious: "
+                    "{} (score={})".format(colored(domain, 'red', attrs=['underline']), score))
+            elif score >= 80:
+                tqdm.tqdm.write(
+                    "[!] Likely    : "
+                    "{} (score={})".format(colored(domain, 'yellow', attrs=['underline']), score))
+            elif score >= 65:
+                tqdm.tqdm.write(
+                    "[+] Potential : "
+                    "{} (score={})".format(colored(domain, attrs=['underline']), score))
+
+            if score >= 75:
                 with open(log_suspicious, 'a') as f:
                     f.write("{}\n".format(domain))
-            elif score > 65:
-                tqdm.tqdm.write(
-                    "Potential: "
-                    "\033[4m{}\033[0m\033[0m (score={})".format(domain, score))
 
 
-certstream.listen_for_events(callback)
+if __name__ == '__main__':
+    with open(suspicious_yaml, 'r') as f:
+        suspicious = yaml.safe_load(f)
+
+    with open(external_yaml, 'r') as f:
+        external = yaml.safe_load(f)
+
+    if external['override_suspicious.yaml'] is True:
+        suspicious = external
+    else:
+        if external['keywords'] is not None:
+            suspicious['keywords'].update(external['keywords'])
+
+        if external['tlds'] is not None:
+            suspicious['tlds'].update(external['tlds'])
+
+    certstream.listen_for_events(callback, url=certstream_url)
